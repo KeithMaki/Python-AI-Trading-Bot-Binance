@@ -1,0 +1,201 @@
+import ccxt
+import pandas as pd
+import ta
+import time
+import numpy as np
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+import warnings
+from sklearn.exceptions import UndefinedMetricWarning
+
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+
+api_key = ""
+api_secret = ""
+
+exchange = ccxt.binance({
+    'apiKey': api_key,
+    'secret': api_secret,
+})
+
+symbol = 'SOL/USDT'
+timeframe = '5m'
+limit = 200
+
+
+# Fetch market data
+def fetch_market_data(exchange, symbol, timeframe, limit):
+    candles = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
+
+
+# Add technical indicators
+def add_technical_indicators(df):
+    df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
+    df['ema_short'] = ta.trend.EMAIndicator(df['close'], window=7).ema_indicator()
+    df['ema_long'] = ta.trend.EMAIndicator(df['close'], window=14).ema_indicator()
+    return df
+
+
+# Define target variable
+def create_target_variable(df):
+    signals = []
+    for i in range(1, len(df)):
+        if df['ema_short'][i - 1] <= df['ema_long'][i - 1] and df['ema_short'][i] > df['ema_long'][i] or df['rsi'][
+            i] <= 30:
+            signals.append(1)  # Buy signal
+        elif df['ema_short'][i - 1] >= df['ema_long'][i - 1] and df['ema_short'][i] < df['ema_long'][i] or df['rsi'][
+            i] >= 70:
+            signals.append(-1)  # Sell signal
+        else:
+            signals.append(0)  # Hold signal
+    return signals
+
+
+# Prepare the dataset
+def prepare_dataset(df):
+    df['signal'] = [0] + create_target_variable(df)
+    features = df[['close', 'rsi', 'ema_short', 'ema_long']]
+    target = df['signal']
+
+    scaler = MinMaxScaler()
+    scaled_features = scaler.fit_transform(features)
+
+    X_train, X_test, y_train, y_test = train_test_split(scaled_features[:-1], target[1:], test_size=0.2,
+                                                        random_state=42)
+
+    X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
+    X_test = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+
+    return X_train, X_test, y_train, y_test, scaler
+
+
+# Build the LSTM model
+def build_lstm_model(input_shape):
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.LSTM(512, input_shape=input_shape, return_sequences=True),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.LSTM(256),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5), loss='binary_crossentropy',
+                  metrics=['accuracy'])
+    return model
+
+
+# Train the LSTM model
+def train_lstm_model(model, X_train, y_train, X_test, y_test, epochs=100, batch_size=32):
+    model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, validation_data=(X_test, y_test))
+    return model
+
+
+# Get trade signals using the LSTM model
+def get_trade_signals_lstm(df, model, scaler):
+    signals = []
+    for i in range(1, len(df)):
+        feature_vector = np.array(df.loc[i - 1, ['close', 'rsi', 'ema_short', 'ema_long']])
+        normalized_features = scaler.transform([feature_vector])
+        input_data = normalized_features.reshape(1, 1, normalized_features.shape[1])
+        signal = model.predict(input_data)
+        signals.append(np.round(signal[0][0]) * 2 - 1)  # Convert 0 or 1 to -1 or 1
+    return signals
+
+
+# Execute trades
+def execute_trades(exchange, symbol, trade_signals):
+    balance = exchange.fetch_balance()
+    quote_currency = symbol.split('/')[1]
+    quote_currency_balance = balance[quote_currency]['free']
+
+    position_size = quote_currency_balance * 0.999  # 99.9% of available balance
+    in_position = False
+
+    for i, signal in enumerate(trade_signals):
+        print(f"Processing signal {i}: {signal}")  # Add this line to see the signals being processed
+        if signal == 1 and not in_position:
+            # Buy the asset
+            print(f"Buying {symbol} at index {i}")
+
+            # Place a buy order
+            buy_order = exchange.create_market_buy_order(symbol, position_size)
+
+            # Set in_position flag to True
+            in_position = True
+
+        elif signal == -1 and in_position:
+            # Sell the asset
+            print(f"Selling {symbol} at index {i}")
+
+            # Place a sell order
+            sell_order = exchange.create_market_sell_order(symbol, position_size)
+
+            # Set in_position flag to False
+            in_position = False
+
+        # If in position and signal is not an exit signal, continue
+        elif in_position and signal != -1:
+            continue
+
+        # Wait for some time before checking the next signal
+        time.sleep(2)
+
+
+def main():
+    warnings.filterwarnings("ignore",
+                            message="X does not have valid feature names, but MinMaxScaler was fitted with feature names")
+
+    print("Fetching initial market data...")
+    df = fetch_market_data(exchange, symbol, timeframe, limit)
+    print("Adding initial technical indicators...")
+    df = add_technical_indicators(df)
+    df = df.dropna().reset_index(drop=True)
+
+    print("Preparing dataset...")
+    X_train, X_test, y_train, y_test, scaler = prepare_dataset(df)
+    print("Building LSTM model...")
+    lstm_model = build_lstm_model(input_shape=(X_train.shape[1], X_train.shape[2]))
+    print("Training LSTM model...")
+    lstm_model = train_lstm_model(lstm_model, X_train, y_train, X_test, y_test)
+
+    while True:
+        try:
+            print("Fetching market data...")
+            df = fetch_market_data(exchange, symbol, timeframe, limit)
+            print("Adding technical indicators...")
+            df = add_technical_indicators(df)
+            df = df.dropna().reset_index(drop=True)
+
+            print("Checking for open trades...")
+            open_positions = exchange.fetch_open_orders(symbol=symbol)
+            if open_positions:
+                print("Open trades found, waiting...")
+                time.sleep(30)
+                continue
+
+            print("Getting trade signals...")
+            trade_signals = get_trade_signals_lstm(df, lstm_model, scaler)
+            print("Executing trades...")
+            execute_trades(exchange, symbol, trade_signals)
+
+            print("Waiting for the next iteration...")
+            time.sleep(1)  # Wait 5 minutes before the next iteration
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            print("Waiting for 5 minutes before trying again...")
+            time.sleep(60 * 5)  # Wait for 5 minutes before trying again
+
+
+if __name__ == '__main__':
+    while True:
+        try:
+            main()
+            print("Waiting for the next iteration...")
+            time.sleep(30)  # Wait 5 minutes before the next iteration
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            print("Waiting for 5 minutes before trying again...")
+            time.sleep(60 * 5)  # Wait for 5 minutes before trying again
